@@ -49,7 +49,7 @@ object ReadoutResultLink {
  *
  * @param resultIn the up-`Flow` from the DSP-side [[ReadoutResultLink.source]]
  */
-case class ReadoutResultSink(
+case class LegacyReadoutResultSink(   // superseded by EventLink.ReadoutResultSink; renamed so the package compiles
     accWidth: Int,
     resAddr: Int  = 4,
     realAddr: Int = 8,
