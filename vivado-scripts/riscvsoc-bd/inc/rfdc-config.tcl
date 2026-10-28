@@ -283,3 +283,39 @@ CONFIG.DAC_Mode33 {3}
 CONFIG.DAC_Nyquist33 {0}
 CONFIG.DAC_Slice33_Enable {true}
 } $RFDC_TARGET
+
+# dspClk ≠ 500 MHz: scale the converter clocking with it — a DAC AXIS word is 16 samples and an ADC word
+# 4 per dspClk, so DAC Fs = 16·f and ADC Fs = 4·f. ADC tile 2 runs its PLL from an f reference and
+# distributes. The DAC PLL can't reach 16·f below 500 MHz (7.6 GS/s at 475: the IP only accepts a 7600 MHz
+# refclk), so DAC tile 2 takes the sample clock directly (PLL off, from the board's LMX) and distributes
+# that input clock (Clock_Dist 1); the other tiles take the distributed sample clock as before.
+# DAC_DIRECT: DAC tile 2 takes its 16x sample clock straight from the refclk pins (PLL bypassed).
+# The tile PLL can only make DAC rates up to ~6.88 GS/s (dspClk <= 430 MHz) or from ~7.9 GS/s
+# (dspClk >= ~492 MHz); in between the clock must arrive at the full rate. On the ZCU216 + CLK104,
+# DAC tile 2's refclk comes from the LMK04828 (<= ~3 GHz), so a DAC_DIRECT build needs board rework.
+set DAC_DIRECT 0
+if {$DSP_FREQ != 500e6} {
+  set _f [expr {$DSP_FREQ / 1e6}]
+  set DAC_DIRECT [expr {16 * $_f > 6880.0 && 16 * $_f < 7900.0}]
+  set _cfg [expr {$DAC_DIRECT ? [list CONFIG.DAC2_PLL_Enable false CONFIG.DAC2_Clock_Dist 1] : {}}]
+  if {$DAC_DIRECT} {
+    puts "CRITICAL WARNING: \[rfdc-config\] DAC [expr {16 * $_f}] MHz is outside the tile PLL's range: DAC tile 2 needs that rate on its refclk pins, which the CLK104 cannot supply"
+  }
+  for {set _t 0} {$_t < 4} {incr _t} {
+    set _pll [expr {$_t == 2}]
+    lappend _cfg \
+      CONFIG.DAC${_t}_Sampling_Rate [format %.3f [expr {16 * $_f / 1000.0}]] \
+      CONFIG.DAC${_t}_Refclk_Freq   [format %.3f [expr {$_pll && !$DAC_DIRECT ? $_f : 16 * $_f}]] \
+      CONFIG.DAC${_t}_Outclk_Freq   [format %.3f $_f] \
+      CONFIG.ADC${_t}_Sampling_Rate [format %.3f [expr {4 * $_f / 1000.0}]] \
+      CONFIG.ADC${_t}_Refclk_Freq   [format %.3f [expr {$_pll ? $_f : 4 * $_f}]] \
+      CONFIG.ADC${_t}_Outclk_Freq   [format %.3f [expr {$_f / 2}]]
+  }
+  puts "\[rfdc-config\] dspClk $_f MHz → DAC [format %.3f [expr {16 * $_f / 1000.0}]] GS/s ([expr {$DAC_DIRECT ? {direct refclk} : {tile-2 PLL}}]), ADC [format %.3f [expr {4 * $_f / 1000.0}]] GS/s"
+  set_property -dict $_cfg $RFDC_TARGET
+  # changing the rates resets each tile's Clock_Source to its own tile (own refclk pins); point tiles
+  # 0/1/3 back at tile 2's distributed clock (ADC source 2 = ADC tile 2, DAC source 6 = DAC tile 2)
+  set _src {}
+  foreach _t {0 1 3} { lappend _src CONFIG.ADC${_t}_Clock_Source 2 CONFIG.DAC${_t}_Clock_Source 6 }
+  set_property -dict $_src $RFDC_TARGET
+}

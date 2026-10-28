@@ -90,7 +90,9 @@ case class PutHub(
   val grantNow = OHMasking.roundRobin(valids, prio)
   when(advance) {
     grant := grantNow
-    when(grantNow.orR)(prio := grantNow.rotateLeft(1))
+    // a round-robin grant is non-empty iff some source is valid: gate on `valids.orR` so the prio
+    // enable doesn't wait on the 17-way round-robin (the 16q BD hub worst path, valid -> prio CE)
+    when(valids.orR)(prio := grantNow.rotateLeft(1))
   }
   val payloads = Vec(srcs.map(_.payload))
   // the pop of the captured source happens the cycle AFTER the capture, from a register, so no

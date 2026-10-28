@@ -157,3 +157,44 @@ def test_remote_setup_params_guard(board):
     rq.setup(drv, m, {})                               # routes via drv.remote (unconditional)
     park = {m.imem(core) for core in range(m.params.qubit_num)}
     assert {a for a, v in fake.mem.items() if v == 0x6F} >= park
+
+
+def _toy_program():
+    """A hand-built image: the magic word, then a 4-word `ts` array holding 10..13."""
+    from riscq.build import MEM_BASE, Image, Program
+    data = rq.MAGIC.to_bytes(4, "little") + b"".join(v.to_bytes(4, "little") for v in (10, 11, 12, 13))
+    img = Image(data=data, symbols={"__rq_magic": (MEM_BASE, 4), "ts": (MEM_BASE + 4, 16)})
+    return Program(img, arrays={"ts": 4})
+
+
+@pytest.mark.parametrize("path", ["remote", "local"])
+def test_load_and_timed_rerun(board, path):
+    """A scheduler's dispatch, over the board client (one RPC per call, timed server-side) and on a
+    local driver: `run.load` writes only the given core and parks `park`, returning the measured
+    seconds; a timed `rerun` reports its three phases and reads only `lengths` words. The remote
+    load also passes the same-build guard."""
+    drv, _, fake, _ = board
+    if path == "local":
+        drv = fake
+    m = SocMap(SocParams.from_json(PARAMS_TEXT))
+    prog = _toy_program()
+    secs = rq.load(drv, m, {0: prog}, park=[1])
+    assert isinstance(secs, float) and secs >= 0
+    assert fake.mem[m.to_host_addr(0, prog.var_addr("__rq_magic"))] == rq.MAGIC
+    assert fake.mem[m.imem(1)] == 0x6F
+    fake.mem[m.host_ctrl + m.HOST_DONE] = 0xFFFFFFFF    # no cores behind the fake: DONE is up
+    tm = {}
+    out = rq.rerun(drv, m, {0: prog}, results=["ts"], lengths={"ts": 2}, timings=tm)
+    assert list(out[0]["ts"]) == [10, 11]
+    assert set(tm) == {"start_s", "poll_s", "read_s"} and all(v >= 0 for v in tm.values())
+    assert list(rq.rerun(drv, m, {0: prog}, results=["ts"])[0]["ts"]) == [10, 11, 12, 13]
+
+
+def test_remote_load_params_guard(board):
+    drv, _, fake, _ = board
+    mine = SocParams.from_json(PARAMS_TEXT)
+    cores4 = tuple(dataclasses.replace(c, name=f"q{i}") for i, c in enumerate(mine.cores * 2))
+    other = dataclasses.replace(mine, cores=cores4)              # a 4-core build, not this one
+    with pytest.raises(Exception, match="wrong bundle"):
+        rq.load(drv, SocMap(other), {0: _toy_program()})
+    assert fake.mem == {}

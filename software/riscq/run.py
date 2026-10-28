@@ -52,19 +52,27 @@ def read_var(drv, m: SocMap, core: int, program: Program, name: str) -> int:
     return drv.read32(m.to_host_addr(core, program.var_addr(name)))
 
 
-def read_array(drv, m: SocMap, core: int, program: Program, name: str) -> np.ndarray:
-    """Fetch a named array global as int32 (element count from the ELF symbol size)."""
+def read_array(drv, m: SocMap, core: int, program: Program, name: str,
+               n: int | None = None) -> np.ndarray:
+    """Fetch a named array global as int32 (element count from the ELF symbol size, or only its
+    first `n` elements)."""
     addr, size = program.var_addr(name), program.var_size(name)
     if size < 4 or size % 4:
         raise ValueError(f"symbol {name!r} has size {size}, not an int32 array")
+    if n is not None:
+        size = min(size, 4 * int(n))
     return np.frombuffer(drv.read_block(m.to_host_addr(core, addr), size), dtype="<i4").copy()
 
 
-def read_host_array(drv, m: SocMap, core: int, program: Program, name: str) -> np.ndarray:
-    """Fetch a host-window array as int32 — the result never entered RAM, so it is read straight out
-    of the driver's result buffer at `hostwin_offset(core) + <the array's window offset>`.
+def read_host_array(drv, m: SocMap, core: int, program: Program, name: str,
+                    n: int | None = None) -> np.ndarray:
+    """Fetch a host-window array as int32 (or only its first `n` elements) — the result never
+    entered RAM, so it is read straight out of the driver's result buffer at
+    `hostwin_offset(core) + <the array's window offset>`.
     Valid only after DONE (the writes are posted, and the ordering contract is that the host reads from python after `poll_done`)."""
     off, count = program.host_arrays[name]
+    if n is not None:
+        count = min(count, int(n))
     buf = drv.read_host(m.hostwin_offset(core) + off, 4 * count)
     return np.frombuffer(buf, dtype="<i4").copy()
 
@@ -264,11 +272,43 @@ def setup(drv, m: SocMap, progs: dict[int, Program]) -> None:
             park_core(drv, m, core)
 
 
+def load(drv, m: SocMap, progs: dict[int, Program], park=()) -> float:
+    """A scheduler's partial `setup`: hold reset, load each given core's image + envelopes +
+    tables, and park the cores in `park`; every other core keeps what it holds, so a dispatch
+    reloads only the cores whose program changed. Only the envelope channels present in a
+    Program's `envelopes` are written — a caller that tracks what each channel already holds drops
+    the resident ones first. Leaves reset ASSERTED, like `setup`, ready for `rerun`. Returns the
+    wall seconds of the driver ops, measured next to the MMIO window: with a `drv.remote` extras
+    object present the whole load runs server-side in one RPC (which also registers the programs
+    for later `rerun`s), so the number excludes the network."""
+    remote = getattr(drv, "remote", None)
+    if remote is not None:
+        return float(remote.load(_params_json(m), {core: _prog_to_wire(prog) for core, prog in progs.items()},
+                                 [int(c) for c in park]))
+    t0 = _time.perf_counter()
+    reset(drv, m, on=True)
+    if any(prog.host_arrays for prog in progs.values()):   # same funnel rule as `setup`
+        base = getattr(drv, "host_base", None)
+        if base is None:
+            raise RuntimeError(f"{type(drv).__name__} has no `host_base`, but a program keeps "
+                               f"arrays in the host window")
+        set_host_window(drv, m, int(base))
+    for core, prog in progs.items():
+        load_program(drv, m, core, prog.image)
+        load_envelopes(drv, m, core, prog)
+        load_tables(drv, m, core, prog)
+    for core in park:
+        park_core(drv, m, core)
+    return _time.perf_counter() - t0
+
+
 def rerun(drv, m: SocMap, progs: dict[int, Program],
           params: dict[int, dict[str, int]] | None = None,
           arrays: dict[int, dict[str, object]] | None = None,
           results: list[str] | None = None,
-          timeout: int = 2_000_000) -> dict[int, dict[str, np.ndarray]]:
+          timeout: int = 2_000_000,
+          lengths: dict[str, int] | None = None,
+          timings: dict | None = None) -> dict[int, dict[str, np.ndarray]]:
     """Re-run an already-`setup` batch without any reload: check magic -> write params + host input
     arrays -> one reset release for all cores -> poll the hardware DONE word -> re-assert reset ->
     read results. Reuses the loaded image/envelopes/tables, so a whole sweep costs O(1) driver
@@ -276,29 +316,45 @@ def rerun(drv, m: SocMap, progs: dict[int, Program],
     it is re-asserted again after the poll and before the results are read; the hardware DONE bits
     clear under that reset, so no stale-DONE clearing write is needed. With a
     `drv.remote` extras object present, the whole batch (params + arrays in, poll, results out) runs
-    server-side in one RPC."""
+    server-side in one RPC.
+
+    `lengths` caps how many elements of a named result are read (e.g. only the shots actually
+    run of a per-shot buffer). A `timings` dict is filled with the wall seconds of the three phases
+    as measured next to the MMIO window (server-side under `drv.remote`): `start_s` (magic check,
+    params, release), `poll_s` (release to DONE), `read_s` (reset + results)."""
     remote = getattr(drv, "remote", None)
     if remote is not None:
-        raw = remote.rerun(list(progs), params or {}, arrays or {}, results, timeout)
+        raw = remote.rerun(list(progs), params or {}, arrays or {}, results, timeout,
+                           lengths=lengths, timed=timings is not None)
+        if timings is not None:
+            raw, tm = raw
+            timings.update(tm)
         return {int(core): {name: np.frombuffer(buf, dtype="<i4").copy() for name, buf in d.items()}
                 for core, d in raw.items()}
     params = params or {}
     arrays = arrays or {}
+    lengths = lengths or {}
+    t0 = _time.perf_counter()
     for core, prog in progs.items():
         check_magic(drv, m, core, prog)                    # guard: image still loaded
         write_params(drv, m, core, prog, params.get(core, {}))
         for name, values in arrays.get(core, {}).items():
             write_array(drv, m, core, prog, name, values)
     reset(drv, m, on=False)
+    t1 = _time.perf_counter()
     poll_done(drv, m, progs, timeout=timeout)
+    t2 = _time.perf_counter()
     # Reset goes back on BEFORE the results are read, so host reads of a core's RAM never overlap live
     # instruction fetch on the shared RAM port. The RAM keeps its
     # contents through reset, and window beats already accepted drain regardless.
     reset(drv, m, on=True)
-    out = {core: {name: (read_host_array(drv, m, core, prog, name) if name in prog.host_arrays
-                         else read_array(drv, m, core, prog, name))
+    out = {core: {name: (read_host_array(drv, m, core, prog, name, lengths.get(name))
+                         if name in prog.host_arrays
+                         else read_array(drv, m, core, prog, name, lengths.get(name)))
                   for name in (list(prog.arrays) if results is None else results)}
            for core, prog in progs.items()}
+    if timings is not None:
+        timings.update(start_s=t1 - t0, poll_s=t2 - t1, read_s=_time.perf_counter() - t2)
     return out
 
 

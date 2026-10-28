@@ -111,10 +111,22 @@ class _RemoteExtras:
     def setup(self, params_json: str, progmap: dict) -> None:
         self._proxy.remote_setup(params_json, progmap)
 
-    def rerun(self, cores, params, arrays, results, timeout):
-        raw = self._proxy.remote_rerun(list(cores), dict(params), dict(arrays),
-                                       results, int(timeout))
-        return {int(c): {n: _to_bytes(b) for n, b in d.items()} for c, d in raw.items()}
+    def load(self, params_json: str, progmap: dict, park: list) -> float:
+        """Partial load (`riscq.run.load`) server-side; returns the server-measured seconds."""
+        return float(self._proxy.remote_load(params_json, progmap, list(park)))
+
+    def rerun(self, cores, params, arrays, results, timeout, lengths=None, timed=False):
+        """`timed` returns (results, server-side phase timings) instead of the results alone. The
+        extra arguments are sent only when used, so a plain rerun still talks to an older server."""
+        args = [list(cores), dict(params), dict(arrays), results, int(timeout)]
+        if lengths or timed:
+            args += [dict(lengths or {}), bool(timed)]
+        raw = self._proxy.remote_rerun(*args)
+        tm = None
+        if timed:
+            raw, tm = raw["out"], dict(raw["timings"])
+        out = {int(c): {n: _to_bytes(b) for n, b in d.items()} for c, d in raw.items()}
+        return (out, tm) if timed else out
 
 
 class CosimDriver:

@@ -15,7 +15,7 @@ SW_ROOT = Path(__file__).resolve().parents[1]
 # imports pynq at module top and only ever runs on the board)
 BOARD_MODULES = ["riscq", "riscq.map", "riscq.build", "riscq.run",
                  "riscq.driver", "riscq.driver.cosim", "riscq.driver.remote",
-                 "riscq.board", "riscq.board.server"]
+                 "riscq.board", "riscq.board.server", "riscq.board.clk104"]
 
 ALLOWED_DISTS = ["numpy", "Pyro5", "serpent"]
 

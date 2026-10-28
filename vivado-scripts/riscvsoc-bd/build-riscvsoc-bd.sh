@@ -31,6 +31,7 @@
 #   RISCQ_CONFIG=software/configs/sim-2q.json ./build-riscvsoc-bd.sh # a different SocParams JSON
 #   RISCQ_SKIP_GEN=1   ./build-riscvsoc-bd.sh # reuse the RTL already in the build dir (skip mill)
 #   RISCQ_PROJ_NAME=foo ./build-riscvsoc-bd.sh # build into <repo>/build/foo (parallel designs)
+#   ./build-riscvsoc-bd.sh RISCQ_PROJ_NAME=foo  # the same, settings as arguments
 #
 # Env: RISCQ_VIVADO_BIN, RISCQ_CONFIG (default software/configs/zcu216-14q.json), RISCQ_SKIP_GEN,
 #   RISCQ_RUN_BITSTREAM (default 1 — bitstream + xsa; set 0 for impl-only),
@@ -41,6 +42,11 @@
 #   See README.md.
 # ============================================================================================
 set -e
+# RISCQ_*=value arguments are exported like the environment (`./build-riscvsoc-bd.sh RISCQ_SPAN=5 …`),
+# so the command line starts with the script (sandbox / permission rules match on that).
+for _a in "$@"; do
+  case "$_a" in RISCQ_*=*) export "$_a" ;; *) echo "[riscvsoc-bd] unknown argument: $_a" >&2; exit 2 ;; esac
+done
 BD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # vivado-scripts/riscvsoc-bd
 REPO_DIR="$(cd "$BD_DIR/../.." && pwd)"                  # repo root
 VIVADO_BIN="${RISCQ_VIVADO_BIN:-$(dirname "$(command -v vivado)")}"
@@ -68,6 +74,13 @@ export RISCQ_IP_RETIMING=1
 export RISCQ_PLACE_DIRECTIVE="${RISCQ_PLACE_DIRECTIVE:-ExtraNetDelay_high}"   # route stays AggressiveExplore (run.tcl)
 export RISCQ_RUN_IMPL=1
 export RISCQ_RUN_BITSTREAM="${RISCQ_RUN_BITSTREAM:-1}"   # bitstream + XSA (hardware handoff) by default; set 0 for impl-only
+# dspClk follows the config's dsp_freq_hz (the clock constraints and the RFDC sample rates scale with it)
+# unless RISCQ_DSP_FREQ is set explicitly.
+if [ -z "${RISCQ_DSP_FREQ:-}" ]; then
+  case "$CONFIG" in /*) CFG_ABS="$CONFIG" ;; *) CFG_ABS="$REPO_DIR/$CONFIG" ;; esac
+  RISCQ_DSP_FREQ=$(python3 -c 'import json,sys; print(int(float(json.load(open(sys.argv[1]))["dsp_freq_hz"])))' "$CFG_ABS")
+fi
+export RISCQ_DSP_FREQ
 
 echo "[riscvsoc-bd] building block design in $BUILD (floorplan, IP retiming, place=$RISCQ_PLACE_DIRECTIVE / route=AggressiveExplore, bitstream+xsa=$RISCQ_RUN_BITSTREAM) …"
 "$VIVADO_BIN/vivado" -nojournal -mode batch -log "$BUILD/vivado.log" -source "$BD_DIR/flow-bd.tcl"

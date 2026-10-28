@@ -164,6 +164,17 @@ class PulseTableSoc(
       t.setName(s"coreTime_$i")
       t
     }
+    // the same replica for the core's channels: `coreTime_i` is pinned in the core's X0 band, so driving
+    // the channels' time registers in the X1–X5 datapath from it is a 0-logic-level wire across the die
+    // (the 16q BD worst path). `chanTime_i` floats with the datapath; same latency from `syncTime`, so the
+    // channels see the identical time every cycle. (Not named coreTime_*, so the floorplan leaves it alone.)
+    val chanTimes = List.tabulate(qubitNum) { i =>
+      val t = RegNext(syncTime(0, 32 bits))
+      t.addAttribute("EQUIVALENT_REGISTER_REMOVAL", "NO")
+      t.addAttribute("MAX_FANOUT", 16)
+      t.setName(s"chanTime_$i")
+      t
+    }
 
     def cp(core: CoreSpec) = coreParam.copy(
       fetchPcWidth = Some(log2Up(core.memDepth) + 2),
@@ -172,7 +183,7 @@ class PulseTableSoc(
     val riscqCores = spec.cores.toList.zipWithIndex.map { case (core, i) =>
       RiscqRfWithPulseTableFiber(
         spec = core, plugins = cp(core).plugins(), dspCd = dspCd, hostCd = hostCd, riscqCd = riscqCd,
-        time = coreTimes(i), batchSize = N, dataWidth = w, adcBatch = adcBatch,
+        time = coreTimes(i), chanTime = chanTimes(i), batchSize = N, dataWidth = w, adcBatch = adcBatch,
         linkPipe = linkPipe, hostWinAddrWidth = hostWinAddrWidth,
         withTestTap = withTest) }
 

@@ -7,6 +7,7 @@ driver, same board) — and stay unverified until M6 hardware bring-up."""
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from pathlib import Path
@@ -23,7 +24,7 @@ AXI_SIZE = 0x1000_0000   # ... -range
 
 # board.json defaults; tile/block keys are "tile,block" strings
 BOARD_DEFAULTS = {
-    "lmk_freq": 500.25,                             # qcal-riscq's proven value on this board
+    "lmk_freq": None,     # None: follow the build's dsp_freq_hz (500 MHz -> qcal-riscq's 500.25)
     "lmx_freq": None,
     "adc_nyquist": 1,
     "dac_nyquist": {"default": 2},
@@ -35,6 +36,21 @@ BOARD_DEFAULTS = {
 }
 
 _refclks_done = False    # LMK/LMX setup runs once per server process, not per load
+
+
+def _register_lmk04828(freq: float) -> None:
+    """Give xrfclk a CLK104 LMK04828 config for `freq` when its package dir ships none, derived
+    from AMD's table (riscq.board.clk104). Runs xrfclk's own one-time discovery first, so
+    set_ref_clks() keeps the injected entry instead of re-reading its .txt files."""
+    from riscq.board.clk104 import lmk04828_regs
+    if not xrfclk.lmk_devices and not xrfclk.lmx_devices:
+        xrfclk._find_devices()
+        xrfclk._read_tics_output()
+    for lmk in xrfclk.lmk_devices:
+        known = xrfclk._Config[lmk["compatible"]]
+        if lmk["compatible"] == "lmk04828" and float(freq) not in known:
+            known[float(freq)] = lmk04828_regs(freq)
+            log.info(f"lmk04828 {freq} MHz: derived from AMD's CLK104 table")
 
 
 class PynqDriver:
@@ -56,6 +72,9 @@ class PynqDriver:
 
         cfg = {**BOARD_DEFAULTS, **(board or {})}
         self.params_text = Path(params_json).read_text()
+        if cfg["lmk_freq"] is None:
+            dsp_mhz = json.loads(self.params_text)["dsp_freq_hz"] / 1e6
+            cfg["lmk_freq"] = 500.25 if dsp_mhz == 500 else dsp_mhz
 
         global _refclks_done
         if not _refclks_done:
@@ -157,6 +176,7 @@ class PynqDriver:
     # ── RFDC ops, reproduced verbatim from the references ──
 
     def refclks(self, lmk_freq: float, lmx_freq: float | None = None) -> None:
+        _register_lmk04828(lmk_freq)
         if lmx_freq is None:
             xrfclk.set_ref_clks(lmk_freq=lmk_freq)
         else:

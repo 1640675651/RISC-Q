@@ -108,9 +108,7 @@ class BoardServer:
     # ── server-side batch runner: the SAME riscq.run functions next to the MMIO window, one RPC
     # per batch. poll_done takes its hardware branch (no `.sim` here). ──
 
-    @_locked
-    def remote_setup(self, params_json, progmap):
-        from riscq import run as _run
+    def _same_build_map(self, params_json):
         from riscq.map import SocMap, SocParams
 
         mine = SocParams.from_json(self.get_params())
@@ -118,22 +116,44 @@ class BoardServer:
         if theirs != mine:   # same-build guard: co-sim can't fail this, hardware can
             raise ValueError(f"client SocParams ({theirs.name!r}) != the loaded bundle's "
                              f"({mine.name!r}) — wrong bundle loaded?")
-        self._m = SocMap(mine)
+        return SocMap(mine)
+
+    @_locked
+    def remote_setup(self, params_json, progmap):
+        from riscq import run as _run
+
+        self._m = self._same_build_map(params_json)
         self._progs = {int(c): _run._prog_from_wire(w) for c, w in progmap.items()}
         _run.setup(self._driver(), self._m, self._progs)
         return None
 
     @_locked
-    def remote_rerun(self, cores, params, arrays, results, timeout):
+    def remote_load(self, params_json, progmap, park):
+        """Partial load for a scheduler (`riscq.run.load`): only the given cores are loaded, `park`
+        is parked, the rest keep their programs. Returns the seconds the driver ops took here,
+        next to the MMIO window — dispatch cost without the network."""
+        from riscq import run as _run
+
+        self._m = self._same_build_map(params_json)
+        progs = {int(c): _run._prog_from_wire(w) for c, w in progmap.items()}
+        for c in park:
+            self._progs.pop(int(c), None)
+        self._progs.update(progs)
+        return _run.load(self._driver(), self._m, progs, [int(c) for c in park])
+
+    @_locked
+    def remote_rerun(self, cores, params, arrays, results, timeout, lengths=None, timed=False):
         from riscq import run as _run
         progs = {int(c): self._progs[int(c)] for c in cores}
+        tm = {} if timed else None
         out = _run.rerun(self._driver(), self._m, progs,
                          params={int(c): v for c, v in dict(params).items()},
                          arrays={int(c): v for c, v in dict(arrays).items()},
                          results=(None if results is None else list(results)),
-                         timeout=int(timeout))
-        return {c: {n: bytes(a.astype("<i4").tobytes()) for n, a in d.items()}
-                for c, d in out.items()}
+                         timeout=int(timeout), lengths=lengths, timings=tm)
+        enc = {c: {n: bytes(a.astype("<i4").tobytes()) for n, a in d.items()}
+               for c, d in out.items()}
+        return {"out": enc, "timings": tm} if timed else enc
 
     # ── board ops: thin delegates ──
 

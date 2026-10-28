@@ -429,14 +429,27 @@ class DriverServer:
         _run.setup(self, self._m, self._progs)
         return None
 
-    def remote_rerun(self, cores, params, arrays, results, timeout):
+    def remote_load(self, params_json, progmap, park):
+        from riscq import run as _run
+        from riscq.map import SocMap, SocParams
+        self._m = SocMap(SocParams.from_json(self._params))
+        progs = {int(c): _run._prog_from_wire(w) for c, w in progmap.items()}
+        for c in park:
+            self._progs.pop(int(c), None)
+        self._progs.update(progs)
+        return _run.load(self, self._m, progs, [int(c) for c in park])
+
+    def remote_rerun(self, cores, params, arrays, results, timeout, lengths=None, timed=False):
         from riscq import run as _run
         progs = {int(c): self._progs[int(c)] for c in cores}
+        tm = {} if timed else None
         out = _run.rerun(self, self._m, progs,
                          params={int(c): v for c, v in dict(params).items()},
                          arrays={int(c): v for c, v in dict(arrays).items()},
-                         results=(None if results is None else list(results)), timeout=int(timeout))
-        return {c: {n: bytes(a.astype("<i4").tobytes()) for n, a in d.items()} for c, d in out.items()}
+                         results=(None if results is None else list(results)), timeout=int(timeout),
+                         lengths=lengths, timings=tm)
+        enc = {c: {n: bytes(a.astype("<i4").tobytes()) for n, a in d.items()} for c, d in out.items()}
+        return {"out": enc, "timings": tm} if timed else enc
 
     def shutdown(self):
         return self._submit("shutdown")

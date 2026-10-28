@@ -16,7 +16,7 @@
 # a bare `NAME !~ *_riscvSoc/*`). Needs the per-core `KEEP_HIERARCHY` (PulseTableSoc tags it) so the
 # `_riscvSoc/` boundary survives opt_design.
 #
-# Env: RISCQ_ROW (3), RISCQ_PERROW (3), RISCQ_CONFINE (global|region|none, global),
+# Env: RISCQ_ROW (3), RISCQ_PERROW (3), RISCQ_SPAN (0 = off; else equal bands over that many rows), RISCQ_CONFINE (global|region|none, global),
 #      RISCQ_BD_BASE (riscq_bd_i/top/inst — the IP instance path), RISCQ_MREG_LOCK (off — fix #2 below).
 # ============================================================================================
 
@@ -24,6 +24,9 @@ set base [expr {[info exists ::env(RISCQ_BD_BASE)] ? $::env(RISCQ_BD_BASE) : "ri
 set baseRow [expr {[info exists ::env(RISCQ_ROW)]    ? $::env(RISCQ_ROW)    : 3}]
 set perRow  [expr {[info exists ::env(RISCQ_PERROW)] ? $::env(RISCQ_PERROW) : 3}]
 set confineStr [expr {[info exists ::env(RISCQ_CONFINE)] ? [string tolower $::env(RISCQ_CONFINE)] : "global"}]
+# RISCQ_SPAN > 0: ignore PERROW and split X0Y<ROW>..X0Y<ROW+SPAN-1> into one equal band per core
+# (bands may straddle a clock-region boundary) — 16 cores over Y3..Y7 get ~19 rows each vs 15 at 4/row.
+set span [expr {[info exists ::env(RISCQ_SPAN)] ? $::env(RISCQ_SPAN) : 0}]
 switch -- $confineStr { region { set confine 2 } global { set confine 1 } default { set confine 0 } }
 
 # Never truncate (and thus error on) large cell collections when one is stringified.
@@ -52,6 +55,32 @@ proc riscq_slice_band {region idx n} {
   set bb [expr {($idx == $n - 1) ? $yhi : ($ba + $per - 1)}]
   return "SLICE_X${xlo}Y${ba}:SLICE_X${xhi}Y${bb}"
 }
+# Band idx of n equal bands over the stacked SLICE rows of `regions` (one X0 column, bottom to top):
+# one rect per region the band touches, each clipped to that region's own X extent, so a band that
+# straddles a clock-region boundary never reaches outside the column.
+proc riscq_span_band {regions idx n} {
+  set ext {}
+  foreach r $regions {
+    set xs {}; set ys {}
+    foreach s [get_sites -quiet -of_objects [get_clock_regions $r] -filter {SITE_TYPE =~ SLICE*}] {
+      if {[regexp {SLICE_X(\d+)Y(\d+)} $s -> x y]} { lappend xs $x; lappend ys $y }
+    }
+    if {[llength $xs] == 0} { error "riscq_span_band: no SLICE sites in $r" }
+    lappend ext [list [tcl::mathfunc::min {*}$xs] [tcl::mathfunc::max {*}$xs] \
+                      [tcl::mathfunc::min {*}$ys] [tcl::mathfunc::max {*}$ys]]
+  }
+  set ylo [lindex $ext 0 2]; set yhi [lindex $ext end 3]
+  set rows [expr {$yhi - $ylo + 1}]
+  set ba [expr {$ylo + ($idx * $rows) / $n}]
+  set bb [expr {$ylo + (($idx + 1) * $rows) / $n - 1}]
+  set rects {}
+  foreach e $ext {
+    lassign $e x0 x1 y0 y1
+    set a [expr {max($ba, $y0)}]; set b [expr {min($bb, $y1)}]
+    if {$a <= $b} { lappend rects "SLICE_X${x0}Y${a}:SLICE_X${x1}Y${b}" }
+  }
+  return $rects
+}
 
 # ── discover the RiscvSoc cores under the IP instance ──
 set ids {}
@@ -61,7 +90,7 @@ for {set i 0} {$i < 64} {incr i} {
 set n [llength $ids]
 if {$n == 0} { error "riscvsoc-bd: found no RiscvSoc cores under ${base}/riscqArea_riscqCores_*_riscvSoc (check RISCQ_BD_BASE / the per-core KEEP_HIERARCHY)" }
 if {$perRow <= 0} { set perRow $n }
-puts "\[riscvsoc-bd\] base=$base; $n cores, perRow=$perRow → X0 rows from Y$baseRow; datapath confine=$confine (2=region 1=global 0=none)"
+puts "\[riscvsoc-bd\] base=$base; $n cores, perRow=$perRow span=$span → X0 rows from Y$baseRow; datapath confine=$confine (2=region 1=global 0=none)"
 
 # ── datapath confine (BEFORE the core bands, so a coreTime replica that lands here is later MOVED into
 #    its core band by add_cells_to_pblock). The `NAME =~ ${base}/*` clause keeps the Zynq PS / RFDC /
@@ -123,6 +152,15 @@ foreach i $ids {
   # `coreTime_i_regNext_reg[*]` (which belongs to the confined datapath).
   set tcells [get_cells -quiet -hierarchical -filter "NAME =~ ${base}/*coreTime_${i}_reg\[*"]
   if {[llength $tcells] > 0} { set coreCells [concat $coreCells $tcells] }
+  if {$span > 0} {
+    set regs {}
+    for {set r $baseRow} {$r < $baseRow + $span} {incr r} { lappend regs X0Y${r} }
+    set rect [riscq_span_band $regs $idx $n]
+    riscq_make_pblock_sites pb_core${i} $coreCells $rect
+    puts "\[riscvsoc-bd\] core $i → X0Y${baseRow}..Y[expr {$baseRow + $span - 1}] band $idx/$n ([llength $coreCells] cells, $rect)"
+    incr idx
+    continue
+  }
   set rect [riscq_slice_band X0Y${rr} $bandIdx $perRow]
   riscq_make_pblock_sites pb_core${i} $coreCells $rect
   puts "\[riscvsoc-bd\] core $i → X0Y${rr} band $bandIdx/$perRow ([llength $coreCells] cells, $rect)"
