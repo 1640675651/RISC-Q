@@ -43,11 +43,14 @@ def _register_lmk04828(freq: float) -> None:
     from AMD's table (riscq.board.clk104). Runs xrfclk's own one-time discovery first, so
     set_ref_clks() keeps the injected entry instead of re-reading its .txt files."""
     from riscq.board.clk104 import lmk04828_regs
-    if not xrfclk.lmk_devices and not xrfclk.lmx_devices:
-        xrfclk._find_devices()
-        xrfclk._read_tics_output()
-    for lmk in xrfclk.lmk_devices:
-        known = xrfclk._Config[lmk["compatible"]]
+    # xrfclk's package re-exports only its public names (`from .xrfclk import *`); the discovery
+    # helpers and the register table live in the `xrfclk.xrfclk` submodule
+    impl = getattr(xrfclk, "xrfclk", xrfclk)
+    if not impl.lmk_devices and not impl.lmx_devices:
+        impl._find_devices()
+        impl._read_tics_output()
+    for lmk in impl.lmk_devices:
+        known = impl._Config[lmk["compatible"]]
         if lmk["compatible"] == "lmk04828" and float(freq) not in known:
             known[float(freq)] = lmk04828_regs(freq)
             log.info(f"lmk04828 {freq} MHz: derived from AMD's CLK104 table")
@@ -84,6 +87,10 @@ class PynqDriver:
         self.overlay = pynq.Overlay(str(xsa), download=download)
         self.rfdc = self.overlay.rf_data_converter
         self.mmio = pynq.MMIO(AXI_BASE, AXI_SIZE)
+        # block I/O through a C loop of single 32-bit beats (None: keep the Python word loop)
+        from riscq.board import fastmmio
+        self._fast = fastmmio.load()
+        self._mmio_ptr = int(self.mmio.array.ctypes.data)
 
         # Auto-MTS is opt-out and non-fatal: board.json "mts": null skips it at bring-up (run
         # drv.board.mts() by hand instead; mts_result stays None = "not run"), and a hard MTS
@@ -142,9 +149,57 @@ class PynqDriver:
         # (self.mmio.array[a:b].tobytes()) issues a multi-beat/wide AXI burst that this gateware's
         # BRAM host read port DECERRs -> SIGBUS ("Bus error"); the PL only handles 32-bit beats.
         nwords = -(-nbytes // 4)
+        if self._fast is not None:               # the same single 32-bit beats, from C
+            from riscq.board import fastmmio
+            return fastmmio.read_words(self._fast, self._mmio_ptr, addr, nwords)[:nbytes]
         buf = b"".join((self.mmio.read(addr + 4 * i) & 0xFFFFFFFF).to_bytes(4, "little")
                        for i in range(nwords))
         return buf[:nbytes]
+
+    # ── batched block I/O: a whole dispatch (or read-back) as one native call ──
+    # Present only with the native helper; callers test `drv.has_segments` and otherwise use
+    # write_block / read_block per block.
+
+    @property
+    def has_segments(self) -> bool:
+        return self._fast is not None
+
+    def _check_segments(self, offs, lens) -> None:
+        if len(offs) and ((offs % 4).any() or int((offs + 4 * lens.astype(np.uint64)).max()) > AXI_SIZE):
+            raise ValueError("segment unaligned or outside the AXI window")
+
+    def write_segments(self, offs, lens, words) -> None:
+        """Write block i = `lens[i]` words at byte offset `offs[i]`; `words` holds all blocks back
+        to back. Arrays are numpy uint64 / uint32 / uint32."""
+        from riscq.board import fastmmio
+        offs = np.ascontiguousarray(offs, dtype=np.uint64)
+        lens = np.ascontiguousarray(lens, dtype=np.uint32)
+        words = np.ascontiguousarray(words, dtype=np.uint32)
+        if int(lens.sum()) != len(words):
+            raise ValueError("segment lengths do not add up to the payload")
+        self._check_segments(offs, lens)
+        fastmmio.write_segments(self._fast, self._mmio_ptr, offs, lens, words)
+
+    def write_segments_delta(self, offs, lens, words, shadow, known) -> int:
+        """`write_segments` that puts a word on the bus only if it differs from the caller's
+        shadow of that RAM (see fastmmio.c). Returns the number of words written."""
+        from riscq.board import fastmmio
+        offs = np.ascontiguousarray(offs, dtype=np.uint64)
+        lens = np.ascontiguousarray(lens, dtype=np.uint32)
+        words = np.ascontiguousarray(words, dtype=np.uint32)
+        shadow = np.ascontiguousarray(shadow, dtype=np.uint64)
+        known = np.ascontiguousarray(known, dtype=np.uint64)
+        if int(lens.sum()) != len(words) or not (len(offs) == len(lens) == len(shadow) == len(known)):
+            raise ValueError("segment arrays do not match the payload")
+        self._check_segments(offs, lens)
+        return fastmmio.write_segments_delta(self._fast, self._mmio_ptr, offs, lens, words, shadow, known)
+
+    def read_segments(self, offs, lens) -> np.ndarray:
+        from riscq.board import fastmmio
+        offs = np.ascontiguousarray(offs, dtype=np.uint64)
+        lens = np.ascontiguousarray(lens, dtype=np.uint32)
+        self._check_segments(offs, lens)
+        return fastmmio.read_segments(self._fast, self._mmio_ptr, offs, lens)
 
     def close(self) -> None:
         """Release the CMA result buffer. Called before a reload so the next driver's
@@ -171,7 +226,11 @@ class PynqDriver:
             raise ValueError(f"write_block length {len(data)} is not a multiple of 4 "
                              "(pynq MMIO word-loops the payload)")
         self._check(addr, len(data))
-        self.mmio.write(addr, data)
+        if self._fast is not None:
+            from riscq.board import fastmmio
+            fastmmio.write_words(self._fast, self._mmio_ptr, addr, data)
+        else:
+            self.mmio.write(addr, data)
 
     # ── RFDC ops, reproduced verbatim from the references ──
 

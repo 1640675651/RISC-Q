@@ -19,3 +19,7 @@ riscq-board-server = "riscq.board.server:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["riscq*"]
+
+# the board driver builds this helper on first use (riscq.board.fastmmio)
+[tool.setuptools.package-data]
+riscq = ["board/*.c"]
